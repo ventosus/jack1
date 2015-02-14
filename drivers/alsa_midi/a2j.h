@@ -60,6 +60,10 @@ struct a2j_port
     int64_t last_out_time;
     
     void * jack_buf;
+
+    jack_ringbuffer_t * outbound_events; // a2j_delivery_event + data
+    int read_ref;
+    size_t read;
 };
 
 struct a2j_stream
@@ -89,7 +93,7 @@ typedef struct alsa_midi_driver
     bool finishing;
 
     jack_ringbuffer_t* port_del; // struct a2j_port*
-    jack_ringbuffer_t* outbound_events; // struct a2j_delivery_event
+    jack_ringbuffer_t* port_wake; // struct a2j_port*
     jack_nframes_t cycle_start;
     
     sem_t output_semaphore;
@@ -106,9 +110,11 @@ struct a2j_alsa_midi_event
     int size;
 };
 
-#define MAX_JACKMIDI_EV_SIZE 16
 
-struct a2j_delivery_event 
+/* MIDI payload in a2j_delivery_event ringbuffer is padded to 8 bytes */
+#define MIDI_PADDED_SIZE(SIZE) (((SIZE) + 7U) & (~7U))
+
+struct a2j_delivery_event
 {
     struct list_head siblings;
     
@@ -119,7 +125,8 @@ struct a2j_delivery_event
     jack_midi_event_t jack_event;
     jack_nframes_t time; /* realtime, not offset time */
     struct a2j_port* port;
-    char midistring[MAX_JACKMIDI_EV_SIZE];
+    size_t padded_size;
+    char midistring[0];
 };
 
 void a2j_error (const char* fmt, ...);

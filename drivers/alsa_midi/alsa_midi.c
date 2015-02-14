@@ -374,63 +374,104 @@ a2j_process_outgoing (
   
   int nevents;
   jack_ringbuffer_data_t vec[2];
-  int i;
+  int i = 0;
   int written = 0;
-  size_t limit;
-  struct a2j_delivery_event* dev;
-  size_t gap = 0;
+  struct a2j_port **port_ptr;
+  struct a2j_delivery_event* ev;
+  char *buf_ptr;
+  char *buf_end;
+  size_t padded_size;
 
-  jack_ringbuffer_get_write_vector (driver->outbound_events, vec);
-
-  dev = (struct a2j_delivery_event*) vec[0].buf;
-  limit = vec[0].len / sizeof (struct a2j_delivery_event);
   nevents = jack_midi_get_event_count (port->jack_buf);
 
-  for (i = 0; (i < nevents) && (written < limit); ++i) {
-
-    jack_midi_event_get (&dev->jack_event, port->jack_buf, i);
-    if (dev->jack_event.size <= MAX_JACKMIDI_EV_SIZE)
-    {
-      dev->time = dev->jack_event.time;
-      dev->port = port;
-      memcpy( dev->midistring, dev->jack_event.buffer, dev->jack_event.size );
-      written++;
-      ++dev;
-    }
-  }
-
-  /* anything left? use the second part of the vector, as much as possible */
-
-  if (i < nevents)
+  if (nevents > 0)
   {
-    if (vec[0].len)
+    jack_ringbuffer_get_write_vector (port->outbound_events, vec);
+
+    buf_end = vec[0].buf + vec[0].len;
+    for (buf_ptr = vec[0].buf; (buf_ptr < buf_end) && (i < nevents);
+      buf_ptr += padded_size, ++i)
     {
-      gap = vec[0].len - written * sizeof(struct a2j_delivery_event);
+      ev = (struct a2j_delivery_event *) buf_ptr;
+
+      jack_midi_event_get (&ev->jack_event, port->jack_buf, i);
+      if (ev->jack_event.size <= MAX_EVENT_SIZE)
+      {
+        padded_size = sizeof(struct a2j_delivery_event)
+          + ( (ev->jack_event.size + 7U) & (~7U) ); /* pad to 8 bytes */
+        /* need one empty a2j_delivery_event struct as sentinel for gap */
+        if (buf_ptr + padded_size + sizeof(struct a2j_delivery_event) > buf_end)
+          break; /* no space left */
+        ev->port = port;
+        ev->time = ev->jack_event.time;
+        ev->padded_size = padded_size;
+        memcpy(ev->midistring, ev->jack_event.buffer, ev->jack_event.size);
+      }
+      else
+        padded_size = 0;
+    }
+    ev = (struct a2j_delivery_event *) buf_ptr;
+    memset(ev, 0, sizeof(struct a2j_delivery_event)); // gap sentinel
+    written = buf_ptr - vec[0].buf;
+
+    /* anything left? use the second part of the vector, as much as possible */
+
+    if (i < nevents)
+    {
+      int gap_size = buf_end - buf_ptr;
+
+      buf_end = vec[1].buf + vec[1].len;
+      for (buf_ptr = vec[1].buf; (buf_ptr < buf_end) && (i < nevents);
+        buf_ptr += padded_size, ++i)
+      {
+        ev = (struct a2j_delivery_event *) buf_ptr;
+
+        jack_midi_event_get(&ev->jack_event, port->jack_buf, i);
+        if (ev->jack_event.size <= MAX_EVENT_SIZE)
+        {
+          padded_size = sizeof(struct a2j_delivery_event)
+            + ( (ev->jack_event.size + 7U) & (~7U) ); /* pad to 8 bytes */
+          if(buf_ptr + ev->padded_size > buf_end)
+            break; /* no space left */
+          ev->port = port;
+          ev->time = ev->jack_event.time;
+          ev->padded_size = padded_size;
+          memcpy(ev->midistring, ev->jack_event.buffer, ev->jack_event.size);
+        } 
+        else
+          padded_size = 0;
+      }
+      if(buf_ptr > vec[1].buf) {
+        a2j_debug( "XXX introducing gap: %d", gap_size);
+        written += gap_size;
+        written += buf_ptr - vec[1].buf;
+      }
     }
 
-    dev = (struct a2j_delivery_event*) vec[1].buf;
+    a2j_debug( "done pushing events: %d of %d", i, nevents);
+    /* clear JACK port buffer; advance ring buffer ptr */
 
-    limit += (vec[1].len / sizeof (struct a2j_delivery_event));
-
-    while ((i < nevents) && (written < limit))
-    {
-      jack_midi_event_get(&dev->jack_event, port->jack_buf, i);
-      if (dev->jack_event.size <= MAX_JACKMIDI_EV_SIZE)
+    if (i > 0) {
+      size_t written2 = 0;
+      jack_ringbuffer_get_write_vector (driver->port_wake, vec);
+      if(vec[0].len >= sizeof(struct a2j_port *))
+        port_ptr = (struct a2j_port **)vec[0].buf;
+      else if(vec[1].len >= sizeof(struct a2j_port *))
       {
-        dev->time = dev->jack_event.time;
-        dev->port = port;
-        memcpy(dev->midistring, dev->jack_event.buffer, dev->jack_event.size);
-        written++;
-        ++dev;
-      } 
-      ++i;
+        written2 += vec[0].len; /* gap */
+        a2j_debug( "YYY introducing gap: %d", written2);
+        port_ptr = (struct a2j_port **)vec[1].buf;
+      }
+      else
+        return 0; /* no space left at all */
+
+      jack_ringbuffer_write_advance (port->outbound_events, written);
+
+      *port_ptr = port;
+      written2 += sizeof(struct a2j_port_ptr *);
+      jack_ringbuffer_write_advance (driver->port_wake, written2);
     }
   }
-
-  a2j_debug( "done pushing events: %d ... gap: %d ", (int)written, (int)gap );
-  /* clear JACK port buffer; advance ring buffer ptr */
-
-  jack_ringbuffer_write_advance (driver->outbound_events, written * sizeof (struct a2j_delivery_event) + gap);
 
   return nevents;
 }
@@ -446,6 +487,50 @@ time_sorter (struct a2j_delivery_event * a, struct a2j_delivery_event * b)
   return 0;
 }
 
+static int
+add_events(struct list_head *evlist, struct a2j_port *port)
+{
+  jack_ringbuffer_data_t vec[2];
+  int i = 0;
+  struct a2j_delivery_event* ev;
+  char *jbuf_ptr;
+  char *jbuf_end;
+
+  jack_ringbuffer_get_read_vector (port->outbound_events, vec);
+
+  port->read = 0;
+
+  if (vec[0].len > 0) {
+    jbuf_end = vec[0].buf + vec[0].len;
+    for ( jbuf_ptr = vec[0].buf;
+      (jbuf_ptr < jbuf_end);
+      jbuf_ptr += ev->padded_size, ++i)
+    {
+      ev = (struct a2j_delivery_event *) jbuf_ptr;
+      if(ev->padded_size == 0)
+        break; /* gap sentinel */
+      list_add_tail(&ev->siblings, evlist);
+    }
+    port->read += jbuf_ptr - vec[0].buf;
+
+    if (vec[1].len > 0) {
+      port->read += jbuf_end - jbuf_ptr; /* gap */
+
+      jbuf_end = vec[1].buf + vec[1].len;
+      for ( jbuf_ptr = vec[1].buf;
+        (jbuf_ptr < jbuf_end);
+        jbuf_ptr += ev->padded_size, ++i)
+      {
+        ev = (struct a2j_delivery_event *) jbuf_ptr;
+        list_add_tail(&ev->siblings, evlist);
+      }
+      port->read += jbuf_ptr - vec[1].buf;
+    }
+  }
+
+  return i;
+}
+
 static void* 
 alsa_output_thread(void * arg)
 {
@@ -455,12 +540,14 @@ alsa_output_thread(void * arg)
   struct list_head evlist;
   struct list_head * node_ptr;
   jack_ringbuffer_data_t vec[2];
-  snd_seq_event_t alsa_event;
   struct a2j_delivery_event* ev;
+  snd_seq_event_t alsa_event;
+  struct a2j_port *port;
   float sr;
   jack_nframes_t now;
   int err;
-  int limit;
+  char *dbuf_ptr;
+  char *dbuf_end;
 
   while (driver->running) {
     /* pre-first, handle port deletion requests */
@@ -471,27 +558,32 @@ alsa_output_thread(void * arg)
     
     INIT_LIST_HEAD(&evlist);
 
-    jack_ringbuffer_get_read_vector (driver->outbound_events, vec);
+    jack_ringbuffer_get_read_vector (driver->port_wake, vec);
 
-    a2j_debug ("output thread: got %d+%d events", 
-               (vec[0].len / sizeof (struct a2j_delivery_event)),
-               (vec[1].len / sizeof (struct a2j_delivery_event)));
-    
-    ev = (struct a2j_delivery_event*) vec[0].buf;
-    limit = vec[0].len / sizeof (struct a2j_delivery_event);
-    for (i = 0; i < limit; ++i) {
-      list_add_tail(&ev->siblings, &evlist);
-      ev++;
+    i = 0;
+    if (vec[0].len > 0) {
+      dbuf_end = vec[0].buf + vec[0].len;
+      for ( dbuf_ptr = vec[0].buf; dbuf_ptr < dbuf_end;
+        dbuf_ptr += sizeof(struct a2j_port *) )
+      {
+        port = *(struct a2j_port **) dbuf_ptr;
+        if(++port->read_ref == 1) /* ignore duplicate ports */
+          i += add_events(&evlist, port);
+      }
+
+      if (vec[1].len > 0) {
+        dbuf_end = vec[1].buf + vec[1].len;
+        for ( dbuf_ptr = vec[1].buf; dbuf_ptr < dbuf_end; 
+          dbuf_ptr += sizeof(struct a2j_port *) )
+        {
+          port = *(struct a2j_port **) dbuf_ptr;
+          if(++port->read_ref == 1) /* ignore duplicate ports */
+            i += add_events(&evlist, port);
+        }
+      }
     }
 
-    ev = (struct a2j_delivery_event*) vec[1].buf;
-    limit = vec[1].len / sizeof (struct a2j_delivery_event);
-    for (i = 0; i < limit; ++i) {
-      list_add_tail(&ev->siblings, &evlist);
-      ev++;
-    }
-
-    if (vec[0].len < sizeof(struct a2j_delivery_event) && (vec[1].len == 0)) {
+    if (i == 0) {
       /* no events: wait for some */
       a2j_debug ("output thread: wait for events");
       sem_wait (&driver->output_semaphore);
@@ -554,13 +646,35 @@ alsa_output_thread(void * arg)
       err = snd_seq_event_output(driver->seq, &alsa_event);
       snd_seq_drain_output (driver->seq);
       now = jack_frame_time (driver->jack_client);
-      a2j_debug("alsa_out: written %d bytes to %s at %d, DELTA = %d", ev->jack_event.size, ev->port->name, now, 
+      a2j_debug("alsa_out: written %d bytes to %s at %d, DELTA = %d", ev->jack_event.size, ev->port->name, now,
                 (int32_t) (now - ev->time));
     }
 
     /* free up space in the FIFO */
+
+    if (vec[0].len > 0) {
+      dbuf_end = vec[0].buf + vec[0].len;
+      for ( dbuf_ptr = vec[0].buf; dbuf_ptr < dbuf_end;
+        dbuf_ptr += sizeof(struct a2j_port *) )
+      {
+        port = *(struct a2j_port **) dbuf_ptr;
+        if( (--port->read_ref == 0) && (port->read > 0) ) /* ignore duplicates */
+          jack_ringbuffer_read_advance (port->outbound_events, port->read);
+      }
+
+      if (vec[1].len > 0) {
+        dbuf_end = vec[1].buf + vec[1].len;
+        for ( dbuf_ptr = vec[1].buf; dbuf_ptr < dbuf_end; 
+          dbuf_ptr += sizeof(struct a2j_port *) )
+        {
+          port = *(struct a2j_port **) dbuf_ptr;
+          if( (--port->read_ref == 0) && (port->read > 0) ) /* ignore duplicates */
+            jack_ringbuffer_read_advance (port->outbound_events, port->read);
+        }
+      }
+    }
     
-    jack_ringbuffer_read_advance (driver->outbound_events, vec[0].len + vec[1].len);
+    jack_ringbuffer_read_advance (driver->port_wake, vec[0].len + vec[1].len);
 
     /* and head back for more */
   }
@@ -698,8 +812,8 @@ alsa_midi_attach (alsa_midi_driver_t* driver, jack_engine_t* engine)
     return -1;
   }
   
-  driver->outbound_events = jack_ringbuffer_create (MAX_EVENT_SIZE * 16 * sizeof(struct a2j_delivery_event));
-  if (driver->outbound_events == NULL) {
+  driver->port_wake = jack_ringbuffer_create(2 * MAX_PORTS * sizeof(struct a2j_port *));
+  if (driver->port_wake == NULL) {
     return -1;
   }
         
@@ -803,7 +917,7 @@ alsa_midi_driver_delete (alsa_midi_driver_t* driver)
   
   sem_destroy (&driver->output_semaphore);
 
-  jack_ringbuffer_free (driver->outbound_events);
+  jack_ringbuffer_free (driver->port_wake);
   jack_ringbuffer_free (driver->port_del);
 }
 

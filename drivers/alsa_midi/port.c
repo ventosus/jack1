@@ -90,6 +90,9 @@ a2j_port_free (struct a2j_port * port)
 	if (port->inbound_events) {
 		jack_ringbuffer_free (port->inbound_events);
 	}
+	if (port->outbound_events) {
+		jack_ringbuffer_free (port->outbound_events);
+	}
 
 	if (port->jack_port != JACK_INVALID_PORT && !port->driver_ptr->finishing) {
 		jack_port_unregister (port->driver_ptr->jack_client, port->jack_port);
@@ -199,7 +202,10 @@ a2j_port_create (alsa_midi_driver_t * driver, int dir, snd_seq_addr_t addr, cons
 		goto fail_free_port;
 	}
 
-	port->inbound_events = jack_ringbuffer_create(MAX_EVENT_SIZE*16);
+	port->inbound_events = jack_ringbuffer_create(
+    (sizeof(struct a2j_alsa_midi_event) + MAX_EVENT_SIZE)*16);
+	port->outbound_events = jack_ringbuffer_create(
+    (sizeof(struct a2j_delivery_event) + MAX_EVENT_SIZE)*16);
 
 	a2j_debug("port created: %s", port->name);
 	return port;
