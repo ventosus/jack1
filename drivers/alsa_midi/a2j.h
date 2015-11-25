@@ -110,6 +110,10 @@ struct a2j_alsa_midi_event
     int size;
 };
 
+<<<<<<< HEAD
+=======
+#define MAX_JACKMIDI_EV_SIZE 64
+>>>>>>> 7d8204825bcfe4a8505fef8b9ce54f1e28c2d6c5
 
 /* MIDI payload in a2j_delivery_event ringbuffer is padded to 8 bytes */
 #define MIDI_PADDED_SIZE(SIZE) (((SIZE) + 7U) & (~7U))
